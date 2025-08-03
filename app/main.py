@@ -4,6 +4,7 @@ from flask_restx import Api, Resource, fields # type: ignore
 from functools import wraps
 from .db import get_connection, init_db
 import logging
+from app.jwt_utils import *
 
 # Define a simple in-memory token store
 tokens = {}
@@ -89,8 +90,18 @@ class Login(Resource):
         cur.execute("SELECT id, username, password, role, full_name, email FROM bank.users WHERE username = %s", (username,))
         user = cur.fetchone()
         if user and user[2] == password:
-            token = secrets.token_hex(16)
-            # Persist the token in the database
+
+            # Creamos el arreglo de datos del usuario
+            user_data = {
+                "id": user[0],
+                "username": user[1],
+                "role": user[3],
+                "full_name": user[4],
+                "email": user[5]
+            }
+            # Generamos el JWT
+            token = generate_jwt_token(user_data)
+
             cur.execute("INSERT INTO bank.tokens (token, user_id) VALUES (%s, %s)", (token, user[0]))
             conn.commit()
             cur.close()
