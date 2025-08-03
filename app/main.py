@@ -71,7 +71,6 @@ class Login(Resource):
     @auth_ns.expect(login_model, validate=True)
     @auth_ns.doc('login')
     def post(self):
-        print(f"Writing log SI ENTRA QUI ..............................")
         """Inicia sesión y devuelve un token JWT de autenticación."""
         data = api.payload
         nombre_usuario = data.get("username")
