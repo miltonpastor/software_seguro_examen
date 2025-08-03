@@ -43,7 +43,7 @@ login_model = auth_ns.model('Login', {
 })
 
 deposit_model = bank_ns.model('Deposit', {
-    'account_number': fields.Integer(required=True, description='Número de cuenta', example=123),
+    'account_number': fields.Integer(required=True, description='Número de cuenta', example=1),
     'amount': fields.Float(required=True, description='Monto a depositar', example=100)
 })
 
