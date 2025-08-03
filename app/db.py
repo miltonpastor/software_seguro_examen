@@ -67,6 +67,30 @@ def init_db():
     ); commit;
     """)
     
+       # Crear tabla de cajeros (solo datos mínimos requeridos)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bank.cajeros (
+        id SERIAL PRIMARY KEY,
+        username TEXT UNIQUE NOT NULL,
+        password TEXT NOT NULL,
+        current_otp TEXT,
+        otp_expires_at TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        last_login TIMESTAMP
+    ); commit;
+    """)
+    
+    # Crear tabla para historial de OTPs (para evitar reutilización)
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS bank.otp_history (
+        id SERIAL PRIMARY KEY,
+        cajero_id INTEGER REFERENCES bank.cajeros(id),
+        otp_code TEXT NOT NULL,
+        used_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        expires_at TIMESTAMP NOT NULL
+    ); commit;
+    """)
+    
     conn.commit()
     
     # Insertar datos de ejemplo si no existen usuarios
@@ -94,6 +118,16 @@ def init_db():
                 INSERT INTO bank.credit_cards (limit_credit, balance, user_id)
                 VALUES (%s, %s, %s); commit;
             """, (5000, 0, user_id))
+        conn.commit()
+            # Insertar cajero de ejemplo si no existe
+    cur.execute("SELECT COUNT(*) FROM bank.cajeros;")
+    cajeros_count = cur.fetchone()[0]
+    if cajeros_count == 0:
+        # Cajero de ejemplo con contraseña que cumple los requisitos
+        cur.execute("""
+            INSERT INTO bank.cajeros (username, password)
+            VALUES (%s, %s);
+        """, ('cajero01', 'CajeroPass123!'))
         conn.commit()
     cur.close()
     conn.close()

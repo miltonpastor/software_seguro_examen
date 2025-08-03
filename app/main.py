@@ -5,6 +5,8 @@ from functools import wraps
 from .db import get_connection, init_db
 from .custom_logger import write_custom_log
 from .jwt_utils import *
+from .otp_utils import *
+from .auth_utils import cajero_required, role_required
 
 # Define a simple in-memory token store
 tokens = {}
@@ -35,11 +37,30 @@ api = Api(
 # Create namespaces for authentication and bank operations
 auth_ns = api.namespace('auth', description='Operaciones de autenticación')
 bank_ns = api.namespace('bank', description='Operaciones bancarias')
+cajero_ns = api.namespace('cajero', description='Operaciones de cajeros')
 
 # Define the expected payload models for Swagger
 login_model = auth_ns.model('Login', {
     'username': fields.String(required=True, description='Nombre de usuario', example='user1'),
     'password': fields.String(required=True, description='Contraseña', example='pass1')
+})
+# Modelo para login de cajeros con OTP
+cajero_login_model = cajero_ns.model('CajeroLogin', {
+    'username': fields.String(required=True, description='Nombre de usuario del cajero', example='cajero01'),
+    'password': fields.String(required=True, description='Contraseña del cajero', example='CajeroPass123!'),
+    'otp': fields.String(required=True, description='Código OTP de 6 dígitos', example='123456')
+})
+
+# Modelo para registro de cajeros
+cajero_register_model = cajero_ns.model('CajeroRegister', {
+    'username': fields.String(required=True, description='Nombre de usuario (letras y números)', example='cajero01'),
+    'password': fields.String(required=True, description='Contraseña (mín. 10 caracteres)', example='CajeroPass123!')
+})
+
+# Modelo para generar OTP
+generate_otp_model = cajero_ns.model('GenerateOTP', {
+    'username': fields.String(required=True, description='Nombre de usuario del cajero', example='cajero01'),
+    'password': fields.String(required=True, description='Contraseña del cajero', example='CajeroPass123!')
 })
 
 deposit_model = bank_ns.model('Deposit', {
@@ -64,6 +85,273 @@ pay_credit_balance_model = bank_ns.model('PayCreditBalance', {
     'amount': fields.Float(required=True, description='Monto a abonar a la deuda de la tarjeta', example=50)
 })
 
+
+# ---------------- Cajero Endpoints ----------------
+
+@cajero_ns.route('/register')
+class RegisterCajero(Resource):
+    @cajero_ns.expect(cajero_register_model, validate=True)
+    @cajero_ns.doc('register_cajero')
+    def post(self):
+        """Registra un nuevo cajero con validaciones de username y password."""
+        data = api.payload
+        username = data.get("username")
+        password = data.get("password")
+        
+        remote_ip = request.remote_addr or "-"
+        
+        # Validar formato de username
+        username_valid, username_msg = validar_formato_username_cajero(username)
+        if not username_valid:
+            write_custom_log(
+                log_type="WARNING",
+                remote_ip=remote_ip,
+                username=username,
+                action=f"Registro de cajero fallido - username inválido: {username_msg}",
+                http_code=400
+            )
+            api.abort(400, username_msg)
+        
+        # Validar formato de password
+        password_valid, password_msg = validar_password_cajero(password)
+        if not password_valid:
+            write_custom_log(
+                log_type="WARNING",
+                remote_ip=remote_ip,
+                username=username,
+                action=f"Registro de cajero fallido - password inválido: {password_msg}",
+                http_code=400
+            )
+            api.abort(400, password_msg)
+        
+        conexion = get_connection()
+        cursor = conexion.cursor()
+        
+        try:
+            # Verificar si el username ya existe
+            cursor.execute("SELECT id FROM bank.cajeros WHERE username = %s", (username,))
+            if cursor.fetchone():
+                write_custom_log(
+                    log_type="WARNING",
+                    remote_ip=remote_ip,
+                    username=username,
+                    action="Registro de cajero fallido - username ya existe",
+                    http_code=409
+                )
+                api.abort(409, "El nombre de usuario ya existe")
+            
+            # Insertar nuevo cajero
+            cursor.execute("""
+                INSERT INTO bank.cajeros (username, password)
+                VALUES (%s, %s) RETURNING id
+            """, (username, password))
+            
+            cajero_id = cursor.fetchone()[0]
+            conexion.commit()
+            
+            write_custom_log(
+                log_type="INFO",
+                remote_ip=remote_ip,
+                username=username,
+                action=f"Cajero registrado exitosamente - ID: {cajero_id}",
+                http_code=201
+            )
+            
+            return {
+                "message": "Cajero registrado exitosamente",
+                "cajero_id": cajero_id,
+                "username": username
+            }, 201
+            
+        except Exception as e:
+            conexion.rollback()
+            write_custom_log(
+                log_type="ERROR",
+                remote_ip=remote_ip,
+                username=username,
+                action=f"Error registrando cajero: {str(e)}",
+                http_code=500
+            )
+            api.abort(500, f"Error interno: {str(e)}")
+        finally:
+            cursor.close()
+            conexion.close()
+
+@cajero_ns.route('/generate-otp')
+class GenerateOTP(Resource):
+    @cajero_ns.expect(generate_otp_model, validate=True)
+    @cajero_ns.doc('generate_otp')
+    def post(self):
+        """Genera un código OTP para el cajero después de validar credenciales."""
+        data = api.payload
+        username = data.get("username")
+        password = data.get("password")
+        
+        remote_ip = request.remote_addr or "-"
+        
+        conexion = get_connection()
+        cursor = conexion.cursor()
+        
+        try:
+            # Validar credenciales del cajero
+            cursor.execute("""
+                SELECT id, username, password 
+                FROM bank.cajeros 
+                WHERE username = %s
+            """, (username,))
+            
+            cajero = cursor.fetchone()
+            
+            if not cajero or cajero[2] != password:
+                write_custom_log(
+                    log_type="WARNING",
+                    remote_ip=remote_ip,
+                    username=username,
+                    action="Generación de OTP fallida - credenciales inválidas",
+                    http_code=401
+                )
+                api.abort(401, "Credenciales inválidas")
+            
+            cajero_id = cajero[0]
+            
+            # Generar y guardar OTP
+            otp_code, expires_at = generar_y_guardar_otp(cajero_id)
+            
+            write_custom_log(
+                log_type="INFO",
+                remote_ip=remote_ip,
+                username=username,
+                action="OTP generado exitosamente",
+                http_code=200
+            )
+            
+            return {
+                "message": "OTP generado exitosamente",
+                "otp": otp_code,  # En producción, esto se enviaría por SMS/email
+                "expires_at": expires_at.isoformat(),
+                "valid_for_minutes": OTP_EXPIRATION_MINUTES
+            }, 200
+            
+        except Exception as e:
+            write_custom_log(
+                log_type="ERROR",
+                remote_ip=remote_ip,
+                username=username,
+                action=f"Error generando OTP: {str(e)}",
+                http_code=500
+            )
+            api.abort(500, f"Error interno: {str(e)}")
+        finally:
+            cursor.close()
+            conexion.close()
+
+@cajero_ns.route('/login')
+class CajeroLogin(Resource):
+    @cajero_ns.expect(cajero_login_model, validate=True)
+    @cajero_ns.doc('cajero_login')
+    def post(self):
+        """Login para cajeros con validación de OTP."""
+        data = api.payload
+        username = data.get("username")
+        password = data.get("password")
+        otp = data.get("otp")
+        
+        remote_ip = request.remote_addr or "-"
+        
+        write_custom_log(
+            log_type="INFO",
+            remote_ip=remote_ip,
+            username=username,
+            action="Intento de login de cajero",
+            http_code=0
+        )
+        
+        conexion = get_connection()
+        cursor = conexion.cursor()
+        
+        try:
+            # Validar credenciales del cajero
+            cursor.execute("""
+                SELECT id, username, password 
+                FROM bank.cajeros 
+                WHERE username = %s
+            """, (username,))
+            
+            cajero = cursor.fetchone()
+            
+            if not cajero or cajero[2] != password:
+                write_custom_log(
+                    log_type="WARNING",
+                    remote_ip=remote_ip,
+                    username=username,
+                    action="Login de cajero fallido - credenciales inválidas",
+                    http_code=401
+                )
+                api.abort(401, "Credenciales inválidas")
+            
+            cajero_id = cajero[0]
+            
+            # Validar OTP
+            otp_valid, otp_msg = validar_otp(cajero_id, otp)
+            if not otp_valid:
+                write_custom_log(
+                    log_type="WARNING",
+                    remote_ip=remote_ip,
+                    username=username,
+                    action=f"Login de cajero fallido - OTP inválido: {otp_msg}",
+                    http_code=401
+                )
+                api.abort(401, f"OTP inválido: {otp_msg}")
+            
+            # Crear datos del usuario para JWT (cajero como rol)
+            datos_usuario = {
+                "id": cajero_id,
+                "username": username,
+                "role": "cajero",
+                "full_name": f"Cajero {username}",
+                "email": f"{username}@banco.com"
+            }
+            
+            # Generar JWT
+            token_jwt = generate_jwt_token(datos_usuario)
+            
+            # Guardar token en tabla de tokens
+            cursor.execute("""
+                INSERT INTO bank.tokens (token, user_id) 
+                VALUES (%s, %s)
+            """, (token_jwt, cajero_id))
+            
+            conexion.commit()
+            
+            write_custom_log(
+                log_type="INFO",
+                remote_ip=remote_ip,
+                username=username,
+                action="Login de cajero exitoso",
+                http_code=200
+            )
+            
+            return {
+                "message": "Login de cajero exitoso",
+                "token": token_jwt,
+                "role": "cajero",
+                "username": username
+            }, 200
+            
+        except Exception as e:
+            conexion.rollback()
+            write_custom_log(
+                log_type="ERROR",
+                remote_ip=remote_ip,
+                username=username,
+                action=f"Error en login de cajero: {str(e)}",
+                http_code=500
+            )
+            api.abort(500, f"Error interno: {str(e)}")
+        finally:
+            cursor.close()
+            conexion.close()
+            
 # ---------------- Authentication Endpoints ----------------
 
 @auth_ns.route('/login')
@@ -357,12 +645,14 @@ class RefrescarToken(Resource):
 @bank_ns.route('/deposit')
 class Deposit(Resource):
     @bank_ns.expect(deposit_model, validate=True)
-    @bank_ns.doc('deposit')
+    @bank_ns.doc('deposit', security='Bearer')
     @token_required
+    @cajero_required  # Solo cajeros pueden hacer depósitos
     def post(self):
         """
         Realiza un depósito en la cuenta especificada.
         Se requiere el número de cuenta y el monto a depositar.
+        RESTRINGIDO: Solo usuarios con rol 'cajero' pueden acceder.
         """
         write_custom_log(
             log_type="INFO",
@@ -426,10 +716,14 @@ class Deposit(Resource):
 @bank_ns.route('/withdraw')
 class Withdraw(Resource):
     @bank_ns.expect(withdraw_model, validate=True)
-    @bank_ns.doc('withdraw')
+    @bank_ns.doc('withdraw', security='Bearer')
     @token_required
+    @cajero_required
     def post(self):
-        """Realiza un retiro de la cuenta del usuario autenticado."""
+        """
+        Realiza un retiro de la cuenta del usuario autenticado.
+        RESTRINGIDO: Solo usuarios con rol 'cajero' pueden acceder.
+        """
         write_custom_log(
             log_type="INFO",
             remote_ip=request.remote_addr or "-",
