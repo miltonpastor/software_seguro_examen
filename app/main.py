@@ -4,7 +4,7 @@ from flask_restx import Api, Resource, fields # type: ignore
 from functools import wraps
 from .db import get_connection, init_db
 import logging
-from app.jwt_utils import *
+from .jwt_utils import *
 
 # Define a simple in-memory token store
 tokens = {}
@@ -80,99 +80,197 @@ class Login(Resource):
     @auth_ns.expect(login_model, validate=True)
     @auth_ns.doc('login')
     def post(self):
-        """Inicia sesión y devuelve un token de autenticación."""
+        """Inicia sesión y devuelve un token JWT de autenticación."""
         data = api.payload
-        username = data.get("username")
-        password = data.get("password")
+        nombre_usuario = data.get("username")
+        contrasena = data.get("password")
         
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT id, username, password, role, full_name, email FROM bank.users WHERE username = %s", (username,))
-        user = cur.fetchone()
-        if user and user[2] == password:
-
+        # Registrar intento de login
+        logging.info(f"Intento de login para usuario: {nombre_usuario}")
+        
+        conexion = get_connection()
+        cursor = conexion.cursor()
+        cursor.execute("SELECT id, username, password, role, full_name, email FROM bank.users WHERE username = %s", (nombre_usuario,))
+        usuario = cursor.fetchone()
+        
+        if usuario and usuario[2] == contrasena:
             # Creamos el arreglo de datos del usuario
-            user_data = {
-                "id": user[0],
-                "username": user[1],
-                "role": user[3],
-                "full_name": user[4],
-                "email": user[5]
+            datos_usuario = {
+                "id": usuario[0],
+                "username": usuario[1],
+                "role": usuario[3],
+                "full_name": usuario[4],
+                "email": usuario[5]
             }
-            # Generamos el JWT
-            token = generate_jwt_token(user_data)
-
-            cur.execute("INSERT INTO bank.tokens (token, user_id) VALUES (%s, %s)", (token, user[0]))
-            conn.commit()
-            cur.close()
-            conn.close()
-            return {"message": "Login successful", "token": token}, 200
+            
+            # Generamos el JWT usando la función actualizada
+            token_jwt = generate_jwt_token(datos_usuario)
+            
+            # Guardamos el token en la base de datos para manejo de blacklist
+            cursor.execute("INSERT INTO bank.tokens (token, user_id) VALUES (%s, %s)", (token_jwt, usuario[0]))
+            conexion.commit()
+            cursor.close()
+            conexion.close()
+            
+            logging.info(f"Login exitoso para usuario: {nombre_usuario}")
+            return {"message": "Login successful", "token": token_jwt}, 200
         else:
-            cur.close()
-            conn.close()
+            cursor.close()
+            conexion.close()
+            logging.warning(f"Credenciales inválidas para usuario: {nombre_usuario}")
             api.abort(401, "Invalid credentials")
 
 @auth_ns.route('/logout')
 class Logout(Resource):
     @auth_ns.doc('logout')
     def post(self):
-        """Invalida el token de autenticación."""
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            api.abort(401, "Authorization header missing or invalid")
-        token = auth_header.split(" ")[1]
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM bank.tokens WHERE token = %s", (token,))
-        if cur.rowcount == 0:
-            conn.commit()
-            cur.close()
-            conn.close()
-            api.abort(401, "Invalid token")
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {"message": "Logout successful"}, 200
+        """Invalida el token JWT añadiéndolo a la blacklist."""
+        header_autorizacion = request.headers.get("Authorization", "")
+        
+        try:
+            # Extraer token del header usando la función utilitaria
+            token_jwt = extraer_token_de_header(header_autorizacion)
+            
+            # Validar el token antes de proceder
+            es_valido, payload, mensaje_error = validar_token_jwt(token_jwt)
+            
+            if not es_valido:
+                logging.warning(f"Intento de logout con token inválido: {mensaje_error}")
+                api.abort(401, mensaje_error)
+            
+            # Eliminar token de la base de datos (blacklist)
+            conexion = get_connection()
+            cursor = conexion.cursor()
+            cursor.execute("DELETE FROM bank.tokens WHERE token = %s", (token_jwt,))
+            
+            if cursor.rowcount == 0:
+                conexion.commit()
+                cursor.close()
+                conexion.close()
+                logging.warning("Intento de logout con token no encontrado en BD")
+                api.abort(401, "Token no encontrado")
+            
+            conexion.commit()
+            cursor.close()
+            conexion.close()
+            
+            logging.info(f"Logout exitoso para usuario: {payload.get('nombre_usuario', 'desconocido')}")
+            return {"message": "Logout successful"}, 200
+            
+        except ValueError as e:
+            logging.warning(f"Error en header de autorización: {str(e)}")
+            api.abort(401, str(e))
 
-# ---------------- Token-Required Decorator ----------------
+# ---------------- Decorador Token-Required ----------------
 
 def token_required(f):
     @wraps(f)
-    def decorated(*args, **kwargs):
-        auth_header = request.headers.get("Authorization", "")
-        if not auth_header.startswith("Bearer "):
-            api.abort(401, "Authorization header missing or invalid")
-        token = auth_header.split(" ")[1]
-        logging.debug("Token: "+str(token))
-        conn = get_connection()
-        cur = conn.cursor()
-        # Query the token in the database and join with users table to retrieve user info
-        cur.execute("""
-            SELECT u.id, u.username, u.role, u.full_name, u.email 
-            FROM bank.tokens t
-            JOIN bank.users u ON t.user_id = u.id
-            WHERE t.token = %s
-        """, (token,))
-        user = cur.fetchone()
-        cur.close()
-        conn.close()
-        if not user:
-            api.abort(401, "Invalid or expired token")
-        g.user = {
-            "id": user[0],
-            "username": user[1],
-            "role": user[2],
-            "full_name": user[3],
-            "email": user[4]
-        }
-        return f(*args, **kwargs)
-    return decorated
+    def decorador(*args, **kwargs):
+        header_autorizacion = request.headers.get("Authorization", "")
+        
+        try:
+            # Extraer token del header
+            token_jwt = extraer_token_de_header(header_autorizacion)
+            logging.debug(f"Token recibido: {token_jwt[:20]}...")
+            
+            # Validar token JWT
+            es_valido, payload, mensaje_error = validar_token_jwt(token_jwt)
+            
+            if not es_valido:
+                logging.warning(f"Token inválido: {mensaje_error}")
+                api.abort(401, mensaje_error)
+            
+            # Verificar que el token esté en la base de datos (no en blacklist)
+            conexion = get_connection()
+            cursor = conexion.cursor()
+            cursor.execute("SELECT COUNT(*) FROM bank.tokens WHERE token = %s", (token_jwt,))
+            token_existe = cursor.fetchone()[0] > 0
+            cursor.close()
+            conexion.close()
+            
+            if not token_existe:
+                logging.warning("Token no encontrado en BD o en blacklist")
+                api.abort(401, "Token ha sido invalidado")
+            
+            # Establecer información del usuario en g usando los datos del token
+            g.usuario = {
+                "id": payload['id_usuario'],
+                "username": payload['nombre_usuario'],
+                "role": payload['rol'],
+                "full_name": payload.get('nombre_completo', ''),
+                "email": payload.get('correo', '')
+            }
+            
+            logging.debug(f"Usuario autenticado: {g.usuario['username']}")
+            return f(*args, **kwargs)
+            
+        except ValueError as e:
+            logging.warning(f"Error en header de autorización: {str(e)}")
+            api.abort(401, str(e))
+        except Exception as e:
+            logging.error(f"Error en validación de token: {str(e)}")
+            api.abort(401, "Error de validación de token")
+    
+    return decorador
+
+@auth_ns.route('/verificar')
+class VerificarToken(Resource):
+    @auth_ns.doc('verificar_token')
+    @token_required
+    def get(self):
+        """Verifica si el token JWT es válido y devuelve información del usuario."""
+        return {
+            "message": "Token es válido",
+            "usuario": {
+                "id": g.usuario['id'],
+                "username": g.usuario['username'],
+                "role": g.usuario['role'],
+                "full_name": g.usuario['full_name'],
+                "email": g.usuario['email']
+            }
+        }, 200
+
+@auth_ns.route('/refrescar')
+class RefrescarToken(Resource):
+    @auth_ns.doc('refrescar_token')
+    @token_required
+    def post(self):
+        """Genera un nuevo token JWT para el usuario autenticado."""
+        try:
+            # Obtener token actual
+            header_autorizacion = request.headers.get("Authorization", "")
+            token_actual = extraer_token_de_header(header_autorizacion)
+            
+            # Validar token actual
+            es_valido, payload_actual, mensaje_error = validar_token_jwt(token_actual)
+            
+            if not es_valido:
+                api.abort(401, mensaje_error)
+            
+            # Generar nuevo token usando la función utilitaria
+            nuevo_token = generar_token_refresco(payload_actual)
+            
+            # Actualizar token en base de datos
+            conexion = get_connection()
+            cursor = conexion.cursor()
+            cursor.execute("DELETE FROM bank.tokens WHERE token = %s", (token_actual,))
+            cursor.execute("INSERT INTO bank.tokens (token, user_id) VALUES (%s, %s)", 
+                         (nuevo_token, g.usuario['id']))
+            conexion.commit()
+            cursor.close()
+            conexion.close()
+            
+            logging.info(f"Token refrescado para usuario: {g.usuario['username']}")
+            return {"message": "Token refrescado exitosamente", "token": nuevo_token}, 200
+            
+        except Exception as e:
+            logging.error(f"Error al refrescar token: {str(e)}")
+            api.abort(500, "Error interno al refrescar token")
 
 # ---------------- Banking Operation Endpoints ----------------
 
 @bank_ns.route('/deposit')
 class Deposit(Resource):
-    logging.debug("Entering....")
     @bank_ns.expect(deposit_model, validate=True)
     @bank_ns.doc('deposit')
     @token_required
@@ -181,31 +279,40 @@ class Deposit(Resource):
         Realiza un depósito en la cuenta especificada.
         Se requiere el número de cuenta y el monto a depositar.
         """
-        data = api.payload
-        account_number = data.get("account_number")
-        amount = data.get("amount", 0)
+        logging.info(f"Operación de depósito iniciada por usuario: {g.usuario['username']}")
         
-        if amount <= 0:
-            api.abort(400, "Amount must be greater than zero")
+        datos = api.payload
+        numero_cuenta = datos.get("account_number")
+        monto = datos.get("amount", 0)
         
-        conn = get_connection()
-        cur = conn.cursor()
-        # Update the specified account using its account number (primary key)
-        cur.execute(
+        if monto <= 0:
+            logging.warning(f"Monto de depósito inválido: {monto} por usuario: {g.usuario['username']}")
+            api.abort(400, "El monto debe ser mayor que cero")
+        
+        conexion = get_connection()
+        cursor = conexion.cursor()
+        
+        # Actualizar la cuenta especificada usando su número de cuenta (clave primaria)
+        cursor.execute(
             "UPDATE bank.accounts SET balance = balance + %s WHERE id = %s RETURNING balance",
-            (amount, account_number)
+            (monto, numero_cuenta)
         )
-        result = cur.fetchone()
-        if not result:
-            conn.rollback()
-            cur.close()
-            conn.close()
-            api.abort(404, "Account not found")
-        new_balance = float(result[0])
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {"message": "Deposit successful", "new_balance": new_balance}, 200
+        resultado = cursor.fetchone()
+        
+        if not resultado:
+            conexion.rollback()
+            cursor.close()
+            conexion.close()
+            logging.warning(f"Depósito fallido - Cuenta {numero_cuenta} no encontrada por usuario: {g.usuario['username']}")
+            api.abort(404, "Cuenta no encontrada")
+        
+        nuevo_balance = float(resultado[0])
+        conexion.commit()
+        cursor.close()
+        conexion.close()
+        
+        logging.info(f"Depósito exitoso: ${monto} a cuenta {numero_cuenta} por usuario: {g.usuario['username']}")
+        return {"message": "Depósito exitoso", "new_balance": nuevo_balance}, 200
 
 @bank_ns.route('/withdraw')
 class Withdraw(Resource):
@@ -214,30 +321,45 @@ class Withdraw(Resource):
     @token_required
     def post(self):
         """Realiza un retiro de la cuenta del usuario autenticado."""
-        data = api.payload
-        amount = data.get("amount", 0)
-        if amount <= 0:
-            api.abort(400, "Amount must be greater than zero")
-        user_id = g.user['id']
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-        if not row:
-            cur.close()
-            conn.close()
-            api.abort(404, "Account not found")
-        current_balance = float(row[0])
-        if current_balance < amount:
-            cur.close()
-            conn.close()
-            api.abort(400, "Insufficient funds")
-        cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s RETURNING balance", (amount, user_id))
-        new_balance = float(cur.fetchone()[0])
-        conn.commit()
-        cur.close()
-        conn.close()
-        return {"message": "Withdrawal successful", "new_balance": new_balance}, 200
+        logging.info(f"Operación de retiro iniciada por usuario: {g.usuario['username']}")
+        
+        datos = api.payload
+        monto = datos.get("amount", 0)
+        
+        if monto <= 0:
+            logging.warning(f"Monto de retiro inválido: {monto} por usuario: {g.usuario['username']}")
+            api.abort(400, "El monto debe ser mayor que cero")
+        
+        id_usuario = g.usuario['id']
+        conexion = get_connection()
+        cursor = conexion.cursor()
+        
+        cursor.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (id_usuario,))
+        fila = cursor.fetchone()
+        
+        if not fila:
+            cursor.close()
+            conexion.close()
+            logging.error(f"Cuenta no encontrada para usuario: {g.usuario['username']}")
+            api.abort(404, "Cuenta no encontrada")
+        
+        balance_actual = float(fila[0])
+        
+        if balance_actual < monto:
+            cursor.close()
+            conexion.close()
+            logging.warning(f"Fondos insuficientes para retiro: {monto} (balance: {balance_actual}) por usuario: {g.usuario['username']}")
+            api.abort(400, "Fondos insuficientes")
+        
+        cursor.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s RETURNING balance", 
+                      (monto, id_usuario))
+        nuevo_balance = float(cursor.fetchone()[0])
+        conexion.commit()
+        cursor.close()
+        conexion.close()
+        
+        logging.info(f"Retiro exitoso: ${monto} por usuario: {g.usuario['username']}")
+        return {"message": "Retiro exitoso", "new_balance": nuevo_balance}, 200
 
 @bank_ns.route('/transfer')
 class Transfer(Resource):
@@ -246,49 +368,72 @@ class Transfer(Resource):
     @token_required
     def post(self):
         """Transfiere fondos desde la cuenta del usuario autenticado a otra cuenta."""
-        data = api.payload
-        target_username = data.get("target_username")
-        amount = data.get("amount", 0)
-        if not target_username or amount <= 0:
-            api.abort(400, "Invalid data")
-        if target_username == g.user['username']:
-            api.abort(400, "Cannot transfer to the same account")
-        conn = get_connection()
-        cur = conn.cursor()
-        # Check sender's balance
-        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (g.user['id'],))
-        row = cur.fetchone()
-        if not row:
-            cur.close()
-            conn.close()
-            api.abort(404, "Sender account not found")
-        sender_balance = float(row[0])
-        if sender_balance < amount:
-            cur.close()
-            conn.close()
-            api.abort(400, "Insufficient funds")
-        # Find target user
-        cur.execute("SELECT id FROM bank.users WHERE username = %s", (target_username,))
-        target_user = cur.fetchone()
-        if not target_user:
-            cur.close()
-            conn.close()
-            api.abort(404, "Target user not found")
-        target_user_id = target_user[0]
+        logging.info(f"Operación de transferencia iniciada por usuario: {g.usuario['username']}")
+        
+        datos = api.payload
+        usuario_destino = datos.get("target_username")
+        monto = datos.get("amount", 0)
+        
+        if not usuario_destino or monto <= 0:
+            logging.warning(f"Datos de transferencia inválidos por usuario: {g.usuario['username']} - destino: {usuario_destino}, monto: {monto}")
+            api.abort(400, "Datos inválidos")
+        
+        if usuario_destino == g.usuario['username']:
+            logging.warning(f"Intento de auto-transferencia por usuario: {g.usuario['username']}")
+            api.abort(400, "No se puede transferir a la misma cuenta")
+        
+        conexion = get_connection()
+        cursor = conexion.cursor()
+        
+        # Verificar balance del remitente
+        cursor.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (g.usuario['id'],))
+        fila = cursor.fetchone()
+        
+        if not fila:
+            cursor.close()
+            conexion.close()
+            logging.error(f"Cuenta del remitente no encontrada para usuario: {g.usuario['username']}")
+            api.abort(404, "Cuenta del remitente no encontrada")
+        
+        balance_remitente = float(fila[0])
+        
+        if balance_remitente < monto:
+            cursor.close()
+            conexion.close()
+            logging.warning(f"Fondos insuficientes para transferencia: {monto} (balance: {balance_remitente}) por usuario: {g.usuario['username']}")
+            api.abort(400, "Fondos insuficientes")
+        
+        # Buscar usuario destino
+        cursor.execute("SELECT id FROM bank.users WHERE username = %s", (usuario_destino,))
+        usuario_objetivo = cursor.fetchone()
+        
+        if not usuario_objetivo:
+            cursor.close()
+            conexion.close()
+            logging.warning(f"Usuario destino no encontrado: {usuario_destino} por usuario: {g.usuario['username']}")
+            api.abort(404, "Usuario destino no encontrado")
+        
+        id_usuario_objetivo = usuario_objetivo[0]
+        
         try:
-            cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (amount, g.user['id']))
-            cur.execute("UPDATE bank.accounts SET balance = balance + %s WHERE user_id = %s", (amount, target_user_id))
-            cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (g.user['id'],))
-            new_balance = float(cur.fetchone()[0])
-            conn.commit()
+            cursor.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", 
+                         (monto, g.usuario['id']))
+            cursor.execute("UPDATE bank.accounts SET balance = balance + %s WHERE user_id = %s", 
+                         (monto, id_usuario_objetivo))
+            cursor.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (g.usuario['id'],))
+            nuevo_balance = float(cursor.fetchone()[0])
+            conexion.commit()
+            logging.info(f"Transferencia exitosa: ${monto} de {g.usuario['username']} a {usuario_destino}")
         except Exception as e:
-            conn.rollback()
-            cur.close()
-            conn.close()
-            api.abort(500, f"Error during transfer: {str(e)}")
-        cur.close()
-        conn.close()
-        return {"message": "Transfer successful", "new_balance": new_balance}, 200
+            conexion.rollback()
+            cursor.close()
+            conexion.close()
+            logging.error(f"Error en transferencia por usuario: {g.usuario['username']} - {str(e)}")
+            api.abort(500, f"Error durante la transferencia: {str(e)}")
+        
+        cursor.close()
+        conexion.close()
+        return {"message": "Transferencia exitosa", "new_balance": nuevo_balance}, 200
 
 @bank_ns.route('/credit-payment')
 class CreditPayment(Resource):
@@ -301,43 +446,60 @@ class CreditPayment(Resource):
         - Descuenta el monto de la cuenta.
         - Aumenta la deuda de la tarjeta de crédito.
         """
-        data = api.payload
-        amount = data.get("amount", 0)
-        if amount <= 0:
-            api.abort(400, "Amount must be greater than zero")
-        user_id = g.user['id']
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-        if not row:
-            cur.close()
-            conn.close()
-            api.abort(404, "Account not found")
-        account_balance = float(row[0])
-        if account_balance < amount:
-            cur.close()
-            conn.close()
-            api.abort(400, "Insufficient funds in account")
+        logging.info(f"Operación de pago con crédito iniciada por usuario: {g.usuario['username']}")
+        
+        datos = api.payload
+        monto = datos.get("amount", 0)
+        
+        if monto <= 0:
+            logging.warning(f"Monto de pago con crédito inválido: {monto} por usuario: {g.usuario['username']}")
+            api.abort(400, "El monto debe ser mayor que cero")
+        
+        id_usuario = g.usuario['id']
+        conexion = get_connection()
+        cursor = conexion.cursor()
+        
+        cursor.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (id_usuario,))
+        fila = cursor.fetchone()
+        
+        if not fila:
+            cursor.close()
+            conexion.close()
+            logging.error(f"Cuenta no encontrada para pago con crédito por usuario: {g.usuario['username']}")
+            api.abort(404, "Cuenta no encontrada")
+        
+        balance_cuenta = float(fila[0])
+        
+        if balance_cuenta < monto:
+            cursor.close()
+            conexion.close()
+            logging.warning(f"Fondos insuficientes para pago con crédito: {monto} (balance: {balance_cuenta}) por usuario: {g.usuario['username']}")
+            api.abort(400, "Fondos insuficientes en cuenta")
+        
         try:
-            cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (amount, user_id))
-            cur.execute("UPDATE bank.credit_cards SET balance = balance + %s WHERE user_id = %s", (amount, user_id))
-            cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-            new_account_balance = float(cur.fetchone()[0])
-            cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
-            new_credit_balance = float(cur.fetchone()[0])
-            conn.commit()
+            cursor.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", 
+                         (monto, id_usuario))
+            cursor.execute("UPDATE bank.credit_cards SET balance = balance + %s WHERE user_id = %s", 
+                         (monto, id_usuario))
+            cursor.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (id_usuario,))
+            nuevo_balance_cuenta = float(cursor.fetchone()[0])
+            cursor.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (id_usuario,))
+            nuevo_balance_credito = float(cursor.fetchone()[0])
+            conexion.commit()
+            logging.info(f"Pago con crédito exitoso: ${monto} por usuario: {g.usuario['username']}")
         except Exception as e:
-            conn.rollback()
-            cur.close()
-            conn.close()
-            api.abort(500, f"Error processing credit card purchase: {str(e)}")
-        cur.close()
-        conn.close()
+            conexion.rollback()
+            cursor.close()
+            conexion.close()
+            logging.error(f"Error en pago con crédito por usuario: {g.usuario['username']} - {str(e)}")
+            api.abort(500, f"Error procesando compra con tarjeta de crédito: {str(e)}")
+        
+        cursor.close()
+        conexion.close()
         return {
-            "message": "Credit card purchase successful",
-            "account_balance": new_account_balance,
-            "credit_card_debt": new_credit_balance
+            "message": "Compra con tarjeta de crédito exitosa",
+            "account_balance": nuevo_balance_cuenta,
+            "credit_card_debt": nuevo_balance_credito
         }, 200
 
 @bank_ns.route('/pay-credit-balance')
@@ -351,53 +513,74 @@ class PayCreditBalance(Resource):
         - Descuenta el monto (o el máximo posible) de la cuenta.
         - Reduce la deuda de la tarjeta de crédito.
         """
-        data = api.payload
-        amount = data.get("amount", 0)
-        if amount <= 0:
-            api.abort(400, "Amount must be greater than zero")
-        user_id = g.user['id']
-        conn = get_connection()
-        cur = conn.cursor()
-        # Check account funds
-        cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-        if not row:
-            cur.close()
-            conn.close()
-            api.abort(404, "Account not found")
-        account_balance = float(row[0])
-        if account_balance < amount:
-            cur.close()
-            conn.close()
-            api.abort(400, "Insufficient funds in account")
-        # Get current credit card debt
-        cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
-        row = cur.fetchone()
-        if not row:
-            cur.close()
-            conn.close()
-            api.abort(404, "Credit card not found")
-        credit_debt = float(row[0])
-        payment = min(amount, credit_debt)
+        logging.info(f"Operación de pago de deuda de crédito iniciada por usuario: {g.usuario['username']}")
+        
+        datos = api.payload
+        monto = datos.get("amount", 0)
+        
+        if monto <= 0:
+            logging.warning(f"Monto de pago de deuda inválido: {monto} por usuario: {g.usuario['username']}")
+            api.abort(400, "El monto debe ser mayor que cero")
+        
+        id_usuario = g.usuario['id']
+        conexion = get_connection()
+        cursor = conexion.cursor()
+        
+        # Verificar fondos en cuenta
+        cursor.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (id_usuario,))
+        fila = cursor.fetchone()
+        
+        if not fila:
+            cursor.close()
+            conexion.close()
+            logging.error(f"Cuenta no encontrada para pago de deuda por usuario: {g.usuario['username']}")
+            api.abort(404, "Cuenta no encontrada")
+        
+        balance_cuenta = float(fila[0])
+        
+        if balance_cuenta < monto:
+            cursor.close()
+            conexion.close()
+            logging.warning(f"Fondos insuficientes para pago de deuda: {monto} (balance: {balance_cuenta}) por usuario: {g.usuario['username']}")
+            api.abort(400, "Fondos insuficientes en cuenta")
+        
+        # Obtener deuda actual de tarjeta de crédito
+        cursor.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (id_usuario,))
+        fila = cursor.fetchone()
+        
+        if not fila:
+            cursor.close()
+            conexion.close()
+            logging.error(f"Tarjeta de crédito no encontrada para usuario: {g.usuario['username']}")
+            api.abort(404, "Tarjeta de crédito no encontrada")
+        
+        deuda_credito = float(fila[0])
+        pago = min(monto, deuda_credito)
+        
         try:
-            cur.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", (payment, user_id))
-            cur.execute("UPDATE bank.credit_cards SET balance = balance - %s WHERE user_id = %s", (payment, user_id))
-            cur.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (user_id,))
-            new_account_balance = float(cur.fetchone()[0])
-            cur.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (user_id,))
-            new_credit_debt = float(cur.fetchone()[0])
-            conn.commit()
+            cursor.execute("UPDATE bank.accounts SET balance = balance - %s WHERE user_id = %s", 
+                         (pago, id_usuario))
+            cursor.execute("UPDATE bank.credit_cards SET balance = balance - %s WHERE user_id = %s", 
+                         (pago, id_usuario))
+            cursor.execute("SELECT balance FROM bank.accounts WHERE user_id = %s", (id_usuario,))
+            nuevo_balance_cuenta = float(cursor.fetchone()[0])
+            cursor.execute("SELECT balance FROM bank.credit_cards WHERE user_id = %s", (id_usuario,))
+            nueva_deuda_credito = float(cursor.fetchone()[0])
+            conexion.commit()
+            logging.info(f"Pago de deuda exitoso: ${pago} por usuario: {g.usuario['username']}")
         except Exception as e:
-            conn.rollback()
-            cur.close()
-            conn.close()
-            api.abort(500, f"Error processing credit balance payment: {str(e)}")
-        cur.close()
-        conn.close()
+            conexion.rollback()
+            cursor.close()
+            conexion.close()
+            logging.error(f"Error en pago de deuda por usuario: {g.usuario['username']} - {str(e)}")
+            api.abort(500, f"Error procesando pago de deuda de tarjeta: {str(e)}")
+        
+        cursor.close()
+        conexion.close()
         return {
-            "message": "Credit card debt payment successful",
-            "account_balance": new_account_balance,
-            "credit_card_debt": new_credit_debt
+            "message": "Pago de deuda de tarjeta exitoso",
+            "account_balance": nuevo_balance_cuenta,
+            "credit_card_debt": nueva_deuda_credito
         }, 200
 
 @app.before_first_request
